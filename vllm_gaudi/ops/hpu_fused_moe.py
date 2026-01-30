@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Union
+from typing import Callable, Union
 
 import torch
 import vllm
@@ -22,6 +22,10 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    def _select_monolithic(self) -> Callable:
+        """Overriding base method"""
+        return self.apply_monolithic
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
