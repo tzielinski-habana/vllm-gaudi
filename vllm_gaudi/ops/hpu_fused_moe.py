@@ -11,6 +11,13 @@ from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.utils import has_quant_config
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
+import vllm.model_executor.layers.fused_moe.router.fused_topk_router \
+    as _fused_topk_router
+import vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router \
+    as _fused_topk_bias_router
+import vllm.model_executor.layers.fused_moe.router.grouped_topk_router \
+    as _grouped_topk_router
+
 
 @UnquantizedFusedMoEMethod.register_oot
 class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -81,9 +88,8 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
 
-        if not layer.use_grouped_topk:
-            topk_ids = topk_ids.to(torch.int64)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_ids = topk_ids.to(torch.int64)
+        topk_weights = topk_weights.to(x.dtype)
 
         if layer.dp_size > 1:
             dp_metadata = get_hpu_dp_metadata()
@@ -134,9 +140,8 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
 
-        if not layer.use_grouped_topk:
-            topk_ids = topk_ids.to(torch.int64)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_ids = topk_ids.to(torch.int64)
+        topk_weights = topk_weights.to(x.dtype)
 
         if layer.dp_size > 1:
             dp_metadata = get_hpu_dp_metadata()
@@ -248,7 +253,83 @@ def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
     return ", ".join(mappings)
 
 
+def _hpu_fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    indices_type: torch.dtype | None = None,
+    scoring_func: str = "softmax",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure PyTorch replacement for fused_topk that avoids CUDA ops.
+
+    Unlike the upstream version which pre-allocates empty tensors and fills
+    them in-place via ops.topk_softmax, this creates tensors directly from
+    the computation — avoiding in-place copy_() ops that break HPU graph
+    compilation.
+    """
+    assert hidden_states.size(0) == gating_output.size(0), \
+        "Number of tokens mismatch"
+
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+    elif scoring_func == "sigmoid":
+        scores = torch.sigmoid(gating_output).to(torch.float32)
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    target_dtype = torch.int32 if indices_type is None else indices_type
+    topk_ids = topk_ids.to(target_dtype)
+
+    token_expert_indices = torch.zeros(hidden_states.size(0), topk, dtype=torch.int32, device=hidden_states.device)
+
+    return topk_weights, topk_ids, token_expert_indices
+
+
+def _hpu_fused_topk_bias(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "softmax",
+    indices_type: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch replacement for fused_topk_bias that avoids CUDA ops."""
+    assert hidden_states.size(0) == gating_output.size(0), \
+        "Number of tokens mismatch"
+
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
+    elif scoring_func == "sigmoid":
+        scores = torch.sigmoid(gating_output).to(torch.float32)
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    scores_for_choice = scores + e_score_correction_bias.unsqueeze(0)
+    topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1)[1]
+    topk_weights = scores.gather(1, topk_ids)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    target_dtype = torch.int32 if indices_type is None else indices_type
+    return topk_weights.to(torch.float32), topk_ids.to(target_dtype)
+
+
 # Apply patches
 FusedMoE.forward = patched_fused_moe_forward
 vllm.model_executor.layers.fused_moe.layer.get_compressed_expert_map = \
     get_compressed_expert_map
+
+# Patch CUDA-only fused_topk / fused_topk_bias with pure-PyTorch
+# implementations that work on HPU (no in-place copy, no _moe_C ops).
+_fused_topk_router.fused_topk = _hpu_fused_topk
+_fused_topk_bias_router.fused_topk_bias = _hpu_fused_topk_bias
+# grouped_topk_router imports these names at module level, so patch there too
+_grouped_topk_router.fused_topk = _hpu_fused_topk
+_grouped_topk_router.fused_topk_bias = _hpu_fused_topk_bias
